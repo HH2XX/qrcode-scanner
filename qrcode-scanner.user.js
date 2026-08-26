@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         网页二维码识别器
 // @name:zh-CN   网页二维码识别器
-// @name:zh-TW   網頁二維碼辨識器
+// @name:zh-TW   網頁 QR Code 識別器
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
-// @description  自动扫描网页二维码，右键图片识别，结果持久化展示，支持打开链接复制定位
+// @version      1.4.0
+// @description  自动扫描网页图片中的二维码，支持右键识别、本地上传识别、结果持久化与快速复制/打开。
 // @author       HH2XX
 // @match        *://*/*
 // @grant        GM_addStyle
@@ -12,7 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @homepage     https://github.com/HH2XX/qrcode-scanner
-// @support_url    https://github.com/HH2XX/qrcode-scanner/issues
+// @supportURL   https://github.com/HH2XX/qrcode-scanner/issues
 // @run-at       document-end
 // @require      https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js
 // ==/UserScript==
@@ -20,685 +20,1465 @@
 (function() {
     'use strict';
 
-    const SCANNED_URLS = new Set();
-    let results = [];
-    let scanTimer = null;
-    let activeToasts = [];
+    const STORAGE_KEY = 'qrResults';
+    const PANEL_ID = 'qrscanner-panel';
+    const TOGGLE_ID = 'qrscanner-toggle';
+    const MENU_ID = 'qrscanner-context-menu';
+    const TOAST_HOST_ID = 'qrscanner-toast-host';
+    const FILE_INPUT_ID = 'qrscanner-file-input';
+    const scannedSources = new Set();
+    const locatedImages = new Map();
 
-    /* ==================== 样式 ==================== */
+    let results = loadResults();
+    let scanTimer = null;
+    let currentContextImage = null;
+    let toastSeed = 0;
+
+    const ui = {
+        panel: null,
+        list: null,
+        empty: null,
+        toggle: null,
+        status: null,
+        uploadInput: null,
+        dropzone: null,
+        menu: null,
+        toastHost: null
+    };
+
     GM_addStyle(`
-        #qrscanner-panel {
-            position: fixed; right: 0; top: 0; width: 400px; height: 100vh;
-            background: rgba(255,255,255,0.98); backdrop-filter: blur(12px) saturate(180%);
-            box-shadow: -4px 0 30px rgba(0,0,0,0.12), -1px 0 0 rgba(0,0,0,0.05);
-            z-index: 2147483646; transform: translateX(100%);
-            transition: transform 0.3s cubic-bezier(0.4,0,0.2,1);
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-            display: flex; flex-direction: column; border-left: 1px solid rgba(0,0,0,0.08);
+        :root {
+            --qr-bg: linear-gradient(180deg, #eef4f1 0%, #f7f7f2 100%);
+            --qr-panel: rgba(252, 253, 251, 0.96);
+            --qr-card: rgba(255, 255, 255, 0.9);
+            --qr-border: rgba(15, 23, 42, 0.08);
+            --qr-shadow: 0 24px 80px rgba(15, 23, 42, 0.16);
+            --qr-text: #172033;
+            --qr-muted: #667085;
+            --qr-accent: #0f766e;
+            --qr-accent-2: #f59e0b;
+            --qr-accent-soft: rgba(15, 118, 110, 0.12);
+            --qr-danger: #c2410c;
+            --qr-danger-soft: rgba(194, 65, 12, 0.12);
         }
-        #qrscanner-panel.open { transform: translateX(0); }
-        .qr-header {
-            padding: 18px 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white; display: flex; align-items: center; justify-content: space-between;
-            position: relative; overflow: hidden;
+
+        #${PANEL_ID} {
+            position: fixed;
+            top: 0;
+            right: 0;
+            width: min(420px, 100vw);
+            height: 100vh;
+            z-index: 2147483645;
+            transform: translateX(100%);
+            transition: transform 0.28s ease;
+            background: var(--qr-panel);
+            backdrop-filter: blur(16px) saturate(150%);
+            box-shadow: var(--qr-shadow);
+            border-left: 1px solid var(--qr-border);
+            display: flex;
+            flex-direction: column;
+            color: var(--qr-text);
+            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
         }
-        .qr-header::before {
-            content: ""; position: absolute; top: -50%; right: -20%; width: 200px; height: 200px;
-            background: rgba(255,255,255,0.1); border-radius: 50%; pointer-events: none;
+
+        #${PANEL_ID}.open {
+            transform: translateX(0);
         }
-        .qr-header h1 { font-size: 18px; font-weight: 700; margin: 0; position: relative; z-index: 1; }
-        .qr-close {
-            background: rgba(255,255,255,0.2); border: none; color: white; width: 32px; height: 32px;
-            border-radius: 8px; cursor: pointer; font-size: 16px; display: flex; align-items: center;
-            justify-content: center; transition: all 0.2s; position: relative; z-index: 2;
+
+        .qrscanner-header {
+            padding: 20px 18px 14px;
+            background:
+                radial-gradient(circle at top right, rgba(245, 158, 11, 0.2), transparent 36%),
+                linear-gradient(135deg, #12372f 0%, #1e5a4f 54%, #0f766e 100%);
+            color: #f8fafc;
         }
-        .qr-close:hover { background: rgba(255,255,255,0.3); transform: scale(1.05); }
-        .qr-body { flex: 1; overflow-y: auto; padding: 16px; background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); }
-        .qr-body::-webkit-scrollbar { width: 6px; }
-        .qr-body::-webkit-scrollbar-track { background: transparent; }
-        .qr-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-        .qr-empty { text-align: center; padding: 60px 20px; color: #94a3b8; }
-        .qr-empty-icon { font-size: 64px; margin-bottom: 16px; opacity: 0.6; }
-        .qr-empty-title { font-size: 16px; font-weight: 600; color: #64748b; margin-bottom: 8px; }
-        .qr-empty-desc { font-size: 13px; color: #94a3b8; line-height: 1.5; }
-        .qr-item {
-            background: white; border-radius: 14px; padding: 16px; margin-bottom: 12px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.06);
-            transition: all 0.2s; position: relative; overflow: hidden;
+
+        .qrscanner-header-top {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
         }
-        .qr-item::before {
-            content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
-            background: linear-gradient(90deg, #667eea, #764ba2); opacity: 0; transition: opacity 0.2s;
+
+        .qrscanner-title {
+            margin: 0;
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: 0.02em;
         }
-        .qr-item:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,0.1); }
-        .qr-item:hover::before { opacity: 1; }
-        .qr-meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-        .qr-badge {
-            display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px;
-            border-radius: 20px; font-size: 11px; font-weight: 600; text-transform: uppercase;
+
+        .qrscanner-subtitle {
+            margin-top: 6px;
+            font-size: 12px;
+            line-height: 1.5;
+            color: rgba(248, 250, 252, 0.82);
         }
-        .qr-badge-url { background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); color: #1e40af; }
-        .qr-badge-text { background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); color: #92400e; }
-        .qr-time { font-size: 11px; color: #94a3b8; font-weight: 500; }
-        .qr-text {
-            word-break: break-all; font-size: 13px; color: #1e293b; line-height: 1.5;
-            padding: 10px 12px; background: #f8fafc; border-radius: 8px;
-            border-left: 3px solid #667eea; font-family: "SF Mono", Monaco, monospace;
-            font-size: 12px; margin-bottom: 12px;
+
+        .qrscanner-close {
+            border: 0;
+            width: 34px;
+            height: 34px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 18px;
+            color: #f8fafc;
+            background: rgba(255, 255, 255, 0.14);
+            transition: transform 0.18s ease, background 0.18s ease;
         }
-        .qr-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-        .qr-btn {
-            border: none; padding: 7px 14px; border-radius: 8px; cursor: pointer;
-            font-size: 12px; font-weight: 500; transition: all 0.2s;
-            display: inline-flex; align-items: center; gap: 4px; font-family: inherit;
+
+        .qrscanner-close:hover {
+            transform: translateY(-1px);
+            background: rgba(255, 255, 255, 0.22);
         }
-        .qr-btn:hover { transform: translateY(-1px); }
-        .qr-btn:active { transform: translateY(0); }
-        .qr-btn-primary {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;
-            box-shadow: 0 2px 8px rgba(102,126,234,0.3);
+
+        .qrscanner-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 14px;
+            background: var(--qr-bg);
         }
-        .qr-btn-primary:hover { box-shadow: 0 4px 12px rgba(102,126,234,0.4); }
-        .qr-btn-secondary { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
-        .qr-btn-secondary:hover { background: #e2e8f0; }
-        .qr-btn-danger { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
-        .qr-btn-danger:hover { background: #fee2e2; }
-        #qrscanner-toggle {
-            position: fixed; right: 20px; bottom: 20px; width: 56px; height: 56px;
-            border-radius: 50%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white; border: none; box-shadow: 0 6px 20px rgba(102,126,234,0.4);
-            font-size: 20px; cursor: pointer; z-index: 2147483645;
-            display: flex; align-items: center; justify-content: center; transition: all 0.3s;
+
+        .qrscanner-body::-webkit-scrollbar {
+            width: 8px;
         }
-        #qrscanner-toggle:hover { transform: scale(1.1) rotate(5deg);
-            box-shadow: 0 8px 25px rgba(102,126,234,0.5); }
-        #qrscanner-context-menu {
-            position: absolute; z-index: 2147483647; background: rgba(255,255,255,0.98);
-            backdrop-filter: blur(12px); border: 1px solid rgba(0,0,0,0.08); border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.15); display: none; overflow: hidden;
-            min-width: 180px; padding: 6px;
+
+        .qrscanner-body::-webkit-scrollbar-thumb {
+            background: rgba(15, 118, 110, 0.26);
+            border-radius: 999px;
         }
-        .qr-cm-item {
-            padding: 10px 14px; font-size: 13px; cursor: pointer; color: #1e293b;
-            border-radius: 8px; transition: all 0.15s; display: flex; align-items: center; gap: 8px;
+
+        .qrscanner-status {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 12px;
         }
-        .qr-cm-item:hover { background: #f1f5f9; color: #667eea; }
-        .qr-cm-item::before { content: "🔍"; }
-        .qr-toast {
-            position: fixed; left: 50%; top: 20px; transform: translateX(-50%);
-            z-index: 2147483647; min-width: 300px; max-width: 500px; padding: 16px;
-            border-radius: 14px; background: rgba(255,255,255,0.98);
-            backdrop-filter: blur(12px) saturate(180%);
-            box-shadow: 0 10px 40px rgba(0,0,0,0.15), 0 0 0 1px rgba(0,0,0,0.05);
-            display: none; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            border: 1px solid rgba(0,0,0,0.06);
+
+        .qrscanner-stat {
+            padding: 12px 14px;
+            border-radius: 16px;
+            background: var(--qr-card);
+            border: 1px solid var(--qr-border);
+            box-shadow: 0 6px 20px rgba(15, 23, 42, 0.04);
         }
-        .qr-toast-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-        .qr-toast-icon {
-            width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center;
-            justify-content: center; font-size: 14px; font-weight: bold; flex-shrink: 0;
+
+        .qrscanner-stat-label {
+            font-size: 11px;
+            color: var(--qr-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
         }
-        .qr-toast-loading .qr-toast-icon {
-            background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); color: #667eea;
-            animation: qrspin 1s linear infinite;
+
+        .qrscanner-stat-value {
+            margin-top: 6px;
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--qr-text);
         }
-        .qr-toast-success .qr-toast-icon { background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); color: #059669; }
-        .qr-toast-error .qr-toast-icon { background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); color: #dc2626; }
-        .qr-toast-hint .qr-toast-icon { background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); color: #d97706; }
-        @keyframes qrspin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        .qr-toast-title { font-weight: 600; font-size: 14px; color: #1e293b; }
-        .qr-toast-message { color: #475569; margin-left: 34px; word-break: break-all; line-height: 1.5; }
-        .qr-toast-actions { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; margin-left: 34px; }
-        .qr-toast-btn {
-            border: none; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;
-            padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 12px;
-            font-weight: 500; transition: all 0.2s; font-family: inherit;
+
+        .qrscanner-toolbar {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 12px;
         }
-        .qr-toast-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(102,126,234,0.4); }
-        .qr-toast-btn-secondary { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
-        .qr-toast-btn-secondary:hover { background: #e2e8f0; box-shadow: none; }
-        .qr-toast-close {
-            position: absolute; top: 12px; right: 12px; background: none; border: none;
-            font-size: 20px; cursor: pointer; color: #94a3b8; width: 28px; height: 28px;
-            display: flex; align-items: center; justify-content: center; border-radius: 6px;
-            transition: all 0.2s;
+
+        .qrscanner-btn {
+            border: 0;
+            border-radius: 14px;
+            padding: 11px 12px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+            font-family: inherit;
         }
-        .qr-toast-close:hover { background: #f1f5f9; color: #475569; }
-        .qr-toast-progress {
-            position: absolute; bottom: 0; left: 0; height: 3px;
-            background: #667eea; border-radius: 0 0 14px 14px; transition: width 0.3s ease;
+
+        .qrscanner-btn:hover {
+            transform: translateY(-1px);
         }
-        .clear-all-btn {
-            margin: 0 16px 16px; padding: 12px;
-            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
-            color: #dc2626; border: 1px solid #fecaca; border-radius: 10px;
-            cursor: pointer; font-size: 12px; font-weight: 600; transition: all 0.2s;
-            display: flex; align-items: center; justify-content: center; gap: 6px; font-family: inherit;
+
+        .qrscanner-btn-primary {
+            color: #f8fafc;
+            background: linear-gradient(135deg, #0f766e 0%, #14532d 100%);
+            box-shadow: 0 10px 24px rgba(15, 118, 110, 0.26);
         }
-        .clear-all-btn:hover {
-            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
-            transform: translateY(-1px); box-shadow: 0 4px 12px rgba(220,38,38,0.15);
+
+        .qrscanner-btn-secondary {
+            color: var(--qr-text);
+            background: rgba(255, 255, 255, 0.82);
+            border: 1px solid var(--qr-border);
+        }
+
+        .qrscanner-btn-danger {
+            color: var(--qr-danger);
+            background: rgba(255, 247, 237, 0.92);
+            border: 1px solid rgba(194, 65, 12, 0.16);
+        }
+
+        .qrscanner-dropzone {
+            position: relative;
+            margin-bottom: 14px;
+            padding: 18px 16px;
+            border-radius: 18px;
+            border: 1.5px dashed rgba(15, 118, 110, 0.28);
+            background:
+                radial-gradient(circle at top right, rgba(245, 158, 11, 0.12), transparent 34%),
+                linear-gradient(180deg, rgba(255, 255, 255, 0.94) 0%, rgba(242, 250, 248, 0.98) 100%);
+            color: var(--qr-text);
+            text-align: center;
+            transition: border-color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+        }
+
+        .qrscanner-dropzone.dragover {
+            transform: translateY(-1px);
+            border-color: var(--qr-accent);
+            box-shadow: 0 12px 24px rgba(15, 118, 110, 0.14);
+        }
+
+        .qrscanner-dropzone-title {
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        .qrscanner-dropzone-desc {
+            margin-top: 6px;
+            font-size: 12px;
+            line-height: 1.6;
+            color: var(--qr-muted);
+        }
+
+        .qrscanner-hint {
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            border-radius: 14px;
+            font-size: 12px;
+            line-height: 1.6;
+            background: rgba(15, 118, 110, 0.08);
+            color: #0f4f4a;
+            border: 1px solid rgba(15, 118, 110, 0.12);
+        }
+
+        .qrscanner-empty {
+            padding: 48px 18px;
+            border-radius: 22px;
+            text-align: center;
+            background: rgba(255, 255, 255, 0.78);
+            border: 1px solid var(--qr-border);
+            color: var(--qr-muted);
+        }
+
+        .qrscanner-empty-icon {
+            font-size: 42px;
+            line-height: 1;
+        }
+
+        .qrscanner-empty-title {
+            margin-top: 12px;
+            font-size: 15px;
+            font-weight: 700;
+            color: var(--qr-text);
+        }
+
+        .qrscanner-empty-desc {
+            margin-top: 8px;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+
+        .qrscanner-list {
+            display: grid;
+            gap: 12px;
+        }
+
+        .qrscanner-item {
+            padding: 14px;
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid var(--qr-border);
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+        }
+
+        .qrscanner-item-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+
+        .qrscanner-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .qrscanner-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 9px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
+
+        .qrscanner-badge-url {
+            color: #115e59;
+            background: rgba(20, 184, 166, 0.14);
+        }
+
+        .qrscanner-badge-text {
+            color: #92400e;
+            background: rgba(245, 158, 11, 0.16);
+        }
+
+        .qrscanner-badge-origin {
+            color: #475467;
+            background: rgba(148, 163, 184, 0.15);
+        }
+
+        .qrscanner-time {
+            flex-shrink: 0;
+            font-size: 11px;
+            color: var(--qr-muted);
+        }
+
+        .qrscanner-data {
+            padding: 12px;
+            border-radius: 14px;
+            background: rgba(243, 247, 245, 0.94);
+            border: 1px solid rgba(15, 118, 110, 0.1);
+            font-size: 12px;
+            line-height: 1.6;
+            color: var(--qr-text);
+            word-break: break-all;
+            white-space: pre-wrap;
+        }
+
+        .qrscanner-source {
+            margin-top: 8px;
+            font-size: 11px;
+            color: var(--qr-muted);
+            word-break: break-all;
+        }
+
+        .qrscanner-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .qrscanner-action {
+            border: 0;
+            border-radius: 12px;
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            font-family: inherit;
+            transition: transform 0.16s ease, background 0.16s ease;
+        }
+
+        .qrscanner-action:hover {
+            transform: translateY(-1px);
+        }
+
+        .qrscanner-action-main {
+            background: rgba(15, 118, 110, 0.12);
+            color: #0f4f4a;
+        }
+
+        .qrscanner-action-soft {
+            background: rgba(148, 163, 184, 0.14);
+            color: #334155;
+        }
+
+        .qrscanner-action-danger {
+            background: rgba(194, 65, 12, 0.12);
+            color: var(--qr-danger);
+        }
+
+        #${TOGGLE_ID} {
+            position: fixed;
+            right: 22px;
+            bottom: 22px;
+            z-index: 2147483644;
+            width: 62px;
+            height: 62px;
+            border: 0;
+            border-radius: 22px;
+            cursor: pointer;
+            color: #f8fafc;
+            font-size: 24px;
+            background:
+                radial-gradient(circle at top right, rgba(245, 158, 11, 0.5), transparent 34%),
+                linear-gradient(135deg, #0f766e 0%, #14532d 100%);
+            box-shadow: 0 18px 40px rgba(15, 118, 110, 0.32);
+            transition: transform 0.22s ease, box-shadow 0.22s ease;
+        }
+
+        #${TOGGLE_ID}:hover {
+            transform: translateY(-2px) rotate(-4deg);
+            box-shadow: 0 20px 44px rgba(15, 118, 110, 0.38);
+        }
+
+        .qrscanner-toggle-badge {
+            position: absolute;
+            top: -6px;
+            right: -4px;
+            min-width: 22px;
+            height: 22px;
+            padding: 0 6px;
+            border-radius: 999px;
+            background: #f97316;
+            color: #fff7ed;
+            font-size: 11px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid rgba(255, 255, 255, 0.85);
+        }
+
+        #${MENU_ID} {
+            position: fixed;
+            z-index: 2147483647;
+            min-width: 188px;
+            padding: 6px;
+            border-radius: 16px;
+            display: none;
+            background: rgba(255, 255, 255, 0.98);
+            border: 1px solid var(--qr-border);
+            box-shadow: 0 20px 48px rgba(15, 23, 42, 0.18);
+            backdrop-filter: blur(14px);
+        }
+
+        .qrscanner-menu-item {
+            display: block;
+            width: 100%;
+            border: 0;
+            background: transparent;
+            text-align: left;
+            padding: 10px 12px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 13px;
+            color: var(--qr-text);
+            font-family: inherit;
+        }
+
+        .qrscanner-menu-item:hover {
+            background: rgba(15, 118, 110, 0.1);
+        }
+
+        #${TOAST_HOST_ID} {
+            position: fixed;
+            top: 18px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 2147483647;
+            display: grid;
+            gap: 10px;
+            width: min(520px, calc(100vw - 24px));
+        }
+
+        .qrscanner-toast {
+            padding: 14px 16px;
+            border-radius: 18px;
+            border: 1px solid var(--qr-border);
+            background: rgba(255, 255, 255, 0.97);
+            box-shadow: 0 16px 34px rgba(15, 23, 42, 0.14);
+            color: var(--qr-text);
+        }
+
+        .qrscanner-toast-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .qrscanner-toast-title {
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .qrscanner-toast-close {
+            border: 0;
+            background: transparent;
+            cursor: pointer;
+            font-size: 16px;
+            color: var(--qr-muted);
+        }
+
+        .qrscanner-toast-message {
+            margin-top: 6px;
+            font-size: 12px;
+            line-height: 1.6;
+            color: #344054;
+            word-break: break-all;
+        }
+
+        .qrscanner-toast-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .qrscanner-toast.loading {
+            border-color: rgba(15, 118, 110, 0.18);
+        }
+
+        .qrscanner-toast.success {
+            border-color: rgba(20, 184, 166, 0.24);
+        }
+
+        .qrscanner-toast.error {
+            border-color: rgba(194, 65, 12, 0.2);
+        }
+
+        .qrscanner-highlight {
+            outline: 3px solid rgba(245, 158, 11, 0.95) !important;
+            outline-offset: 4px !important;
+            box-shadow: 0 0 0 8px rgba(245, 158, 11, 0.2), 0 0 24px rgba(15, 118, 110, 0.26) !important;
+            transition: box-shadow 0.18s ease;
+        }
+
+        @media (max-width: 560px) {
+            #${PANEL_ID} {
+                width: 100vw;
+            }
+
+            .qrscanner-toolbar {
+                grid-template-columns: 1fr;
+            }
+
+            .qrscanner-status {
+                grid-template-columns: 1fr 1fr;
+            }
         }
     `);
 
-    /* ==================== 工具 ==================== */
-    function escapeHtml(text) {
-        const d = document.createElement('div');
-        d.textContent = text;
-        return d.innerHTML;
-    }
-
-    function copyText(text) {
-        if (navigator.clipboard && window.isSecureContext) {
-            navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
-        } else fallbackCopy(text);
-    }
-    function fallbackCopy(text) {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none;';
-        document.body.appendChild(ta); ta.select();
-        try { document.execCommand('copy'); } catch (e) {}
-        document.body.removeChild(ta);
-    }
-
-    /* ==================== Toast（修复交互） ==================== */
-    function showToast(message, type = 'info', duration = 0, actions = [], title = '') {
-        const existing = activeToasts.find(t => t.type === type && !t.persistent);
-        if (existing) removeToast(existing);
-
-        const toast = document.createElement('div');
-        toast.className = `qr-toast qr-toast-${type}`;
-        toast.setAttribute('role', 'alert');
-
-        const iconMap = { loading: '⟳', success: '✓', error: '✕', hint: '💡', info: 'ℹ' };
-        const titleMap = { loading: '识别中', success: '识别成功', error: '识别失败', hint: '提示', info: '提示' };
-        const iconText = iconMap[type] || 'ℹ';
-        const titleText = title || titleMap[type] || '提示';
-
-        // actions 支持两种形态：字符串数组 或 {text, cls, handler} 对象数组
-        let btnHtml = '';
-        if (actions.length) {
-            btnHtml = '<div class="qr-toast-actions">';
-            actions.forEach((a, i) => {
-                if (typeof a === 'string') {
-                    btnHtml += a;
-                } else {
-                    btnHtml += `<button class="${a.cls || 'qr-toast-btn'}" data-idx="${i}">${a.text</button>`;
-                }
-            });
-            btnHtml +=</div>';
+    function loadResults() {
+        try {
+            const raw = GM_getValue(STORAGE_KEY, '[]');
+            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+        } catch (error) {
+            return [];
         }
+    }
+
+    function saveResults() {
+        try {
+            GM_setValue(STORAGE_KEY, JSON.stringify(results));
+        } catch (error) {}
+    }
+
+    function makeHash(input) {
+        let hash = 0;
+        const text = String(input || '');
+        for (let i = 0; i < text.length; i += 1) {
+            hash = ((hash << 5) - hash) + text.charCodeAt(i);
+            hash |= 0;
+        }
+        return `qr_${Math.abs(hash)}`;
+    }
+
+    function isUrl(text) {
+        return /^https?:\/\//i.test(String(text || '').trim());
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = String(text ?? '');
+        return div.innerHTML;
+    }
+
+    function shortText(text, max = 140) {
+        const value = String(text || '');
+        return value.length <= max ? value : `${value.slice(0, max)}...`;
+    }
+
+    async function copyText(text) {
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+            } else {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.style.position = 'fixed';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                textarea.remove();
+            }
+            return true;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function ensureToastHost() {
+        if (ui.toastHost) {
+            return ui.toastHost;
+        }
+        const host = document.createElement('div');
+        host.id = TOAST_HOST_ID;
+        document.body.appendChild(host);
+        ui.toastHost = host;
+        return host;
+    }
+
+    function showToast(options) {
+        const {
+            type = 'info',
+            title = '提示',
+            message = '',
+            actions = [],
+            duration = 2200
+        } = options || {};
+
+        const host = ensureToastHost();
+        const toast = document.createElement('div');
+        const toastId = `qrscanner-toast-${++toastSeed}`;
+        toast.className = `qrscanner-toast ${type}`;
+        toast.dataset.toastId = toastId;
 
         toast.innerHTML = `
-            <button class="qr-toast-close" data-close="1">✕</button>
-            <div class="qr-toast-header">
-                <div class="qr-toast-icon">${iconText</div>
-                <div class="qr-toast-title">${escapeHtml(titleText)}</div>
-           </div>
-            <div class="qr-toast-message">${typeof message === 'string' ? escapeHtml(message) : message</div>
-            ${btnHtml}
-            ${duration > 0 ? '<div class="qr-toast-progress" style="width:100%</div>' : ''}
+            <div class="qrscanner-toast-head">
+                <div class="qrscanner-toast-title">${escapeHtml(title)}</div>
+                <button class="qrscanner-toast-close" type="button" data-close="${toastId}">×</button>
+            </div>
+            <div class="qrscanner-toast-message">${escapeHtml(message)}</div>
+            <div class="qrscanner-toast-actions"></div>
         `;
 
-        document.body.appendChild(toast);
-        toast.style.display = 'block';
-
-        // 立即绑定关闭按钮
-        toast.querySelector('[data-close]').onclick = () => removeToast(toastData);
-
-        // 立即绑定对象型 actions 的 handler
-        actions.forEach((a, i) => {
-            if (typeof a === 'object' && typeof a.handler === 'function') {
-                const btn = toast.querySelector(`button[data-idx="${i}"]`);
-                if (btn) btn.onclick = a.handler;
-            }
+        const actionsWrap = toast.querySelector('.qrscanner-toast-actions');
+        actions.forEach((action) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = action.className || 'qrscanner-action qrscanner-action-main';
+            button.textContent = action.text;
+            button.addEventListener('click', () => {
+                try {
+                    action.onClick && action.onClick();
+                } finally {
+                    if (action.closeOnClick !== false) {
+                        toast.remove();
+                    }
+                }
+            });
+            actionsWrap.appendChild(button);
         });
 
-        const toastData = {
-            element: toast,
-            type,
-            persistent: duration === 0,
-            createdAt: Date.now()
-        };
-        activeToasts.push(toastData);
+        if (!actions.length) {
+            actionsWrap.remove();
+        }
 
+        toast.querySelector('[data-close]').addEventListener('click', () => {
+            toast.remove();
+        });
+
+        host.appendChild(toast);
         if (duration > 0) {
-            const progress = toast.querySelector('.qr-toast-progress');
-            if (progress) setTimeout(() => { progress.style.width = '0%'; }, 50);
-            setTimeout(() => removeToast(toastData), duration);
+            window.setTimeout(() => toast.remove(), duration);
         }
-
-        return toastData;
+        return toast;
     }
 
-    function removeToast(toastData) {
-        if (!toastData) return;
-        if (toastData.element && toastData.element.parentNode) toastData.element.remove();
-        activeToasts = activeToasts.filter(t => t !== toastData);
+    function normalizeResult(item) {
+        const data = String(item.data || '').trim();
+        const source = String(item.source || '').trim();
+        const origin = item.origin || 'page';
+        return {
+            id: item.id || makeHash(`${origin}|${source}|${data}`),
+            data,
+            source,
+            origin,
+            kind: item.kind || (isUrl(data) ? 'url' : 'text'),
+            time: item.time || new Date().toLocaleTimeString(),
+            createdAt: Number(item.createdAt) || Date.now(),
+            pageUrl: item.pageUrl || location.href
+        };
     }
 
-    /* ==================== 解码核心（识别率优化） ==================== */
-    async function decodeCanvas(imageBitmapOrElement) {
-        try {
-            const canvas = document.createElement('canvas');
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    function upsertResults(items) {
+        const normalized = (items || [])
+            .map(normalizeResult)
+            .filter((item) => item.data);
 
-            let width = 0, height = 0;
-            if (imageBitmapOrElement instanceof ImageBitmap) {
-                width = imageBitmapOrElement.width;
-                height = imageBitmapOrElement.height;
-            } else {
-                width = imageBitmapOrElement.naturalWidth || imageBitmapOrElement.width;
-                height = imageBitmapOrElement.naturalHeight || imageBitmapOrElement.height;
-            }
-            if (!width || !height || width < 21 || height < 21) return null;
-
-            const maxDim = 1000;
-            const minDim = 200;
-            const maxSide = Math.max(width, height);
-            let scale = Math.min(1, maxDim / maxSide);
-            if (maxSide < minDim) scale = Math.max(scale, minDim / maxSide);
-
-            const w = Math.max(1, Math.floor(width * scale));
-            const h = Math.max(1, Math.floor(height * scale));
-            canvas.width = w; canvas.height = h;
-            ctx.drawImage(imageBitmapOrElement, 0, 0, w, h);
-
-            const imageData = ctx.getImageData(0, 0, w, h);
-            const data = imageData.data;
-            // 对比度增强
-            for (let i = 0; i < data.length; i += 4) {
-                const gray = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-                const enhanced = gray > 128 ? Math.min(255, gray + 35) : Math.max(0, gray - 35);
-                data[i] = data[i+1] = data[i+2] = enhanced;
-            }
-            ctx.putImageData(imageData, 0, 0);
-
-            // 多模式解码
-            const modes = [
-                { inversionAttempts: 'dontInvert' },
-                { inversionAttempts: 'invert' },
-                { inversionAttempts: 'both' }
-            ];
-            for (const mode of modes) {
-                try {
-                    const code = jsQR(imageData.data, w, h, mode);
-                    if (code && code.data && code.data.trim().length > 0) {
-                        return code.data.trim();
-                    }
-                } catch (e) {}
-            }
-            return null;
-        } catch (err) {
-            return null;
+        if (!normalized.length) {
+            return;
         }
+
+        const existing = new Map(results.map((item) => [`${item.origin}|${item.source}|${item.data}`, item]));
+        normalized.forEach((item) => {
+            existing.set(`${item.origin}|${item.source}|${item.data}`, item);
+        });
+
+        results = Array.from(existing.values())
+            .sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0));
+        saveResults();
+        renderResults();
     }
 
-    /* ==================== 扫描 ==================== */
-    async function scanImage(img) {
-        const src = img.src || img.getAttribute('src');
-        if (!src || SCANNED_URLS.has(src)) return null;
+    function removeResult(id) {
+        results = results.filter((item) => item.id !== id);
+        saveResults();
+        renderResults();
+    }
 
-        const nw = img.naturalWidth || 0, nh = img.naturalHeight || 0;
-        if (nw < 20 || nh < 20 || nw * nh < 400) {
-            SCANNED_URLS.add(src);
-            return null;
+    function clearResults() {
+        results = [];
+        saveResults();
+        renderResults();
+    }
+
+    function updateStatus() {
+        if (!ui.status || !ui.toggle) {
+            return;
+        }
+        const pageCount = results.filter((item) => item.pageUrl === location.href).length;
+        ui.status.innerHTML = `
+            <div class="qrscanner-stat">
+                <div class="qrscanner-stat-label">当前页结果</div>
+                <div class="qrscanner-stat-value">${pageCount}</div>
+            </div>
+            <div class="qrscanner-stat">
+                <div class="qrscanner-stat-label">总结果数</div>
+                <div class="qrscanner-stat-value">${results.length}</div>
+            </div>
+        `;
+
+        const badge = ui.toggle.querySelector('.qrscanner-toggle-badge');
+        badge.textContent = String(Math.min(results.length, 99));
+        badge.style.display = results.length ? 'flex' : 'none';
+    }
+
+    function renderResults() {
+        if (!ui.list || !ui.empty) {
+            return;
         }
 
-        try {
-            const data = await decodeCanvas(img);
-            if (data) {
-                SCANNED_URLS.add(src);
-                return {
-                    id: btoa(src).replace(/[^a-z0-9]/gi, '').slice(-8),
-                    src,
-                    data,
-                    kind: /^https?:\/\//i.test(data) ? 'url' : 'text',
-                    time: new Date().toLocaleTimeString()
-                };
-            }
-        } catch (e) {}
-        SCANNED_URLS.add(src);
+        updateStatus();
+        if (!results.length) {
+            ui.empty.style.display = 'block';
+            ui.list.innerHTML = '';
+            return;
+        }
+
+        ui.empty.style.display = 'none';
+        ui.list.innerHTML = results.map((item) => {
+            const openButton = item.kind === 'url'
+                ? `<button class="qrscanner-action qrscanner-action-main" data-action="open" data-id="${item.id}">打开链接</button>`
+                : '';
+
+            const locateButton = item.origin === 'page' || item.origin === 'context'
+                ? `<button class="qrscanner-action qrscanner-action-soft" data-action="locate" data-id="${item.id}">定位图片</button>`
+                : '';
+
+            const sourceLabelMap = {
+                page: '页面扫描',
+                context: '右键识别',
+                upload: '本地上传'
+            };
+
+            return `
+                <div class="qrscanner-item" data-result-id="${item.id}">
+                    <div class="qrscanner-item-top">
+                        <div class="qrscanner-badges">
+                            <span class="qrscanner-badge ${item.kind === 'url' ? 'qrscanner-badge-url' : 'qrscanner-badge-text'}">
+                                ${item.kind === 'url' ? '链接' : '文本'}
+                            </span>
+                            <span class="qrscanner-badge qrscanner-badge-origin">
+                                ${sourceLabelMap[item.origin] || '来源未知'}
+                            </span>
+                        </div>
+                        <div class="qrscanner-time">${escapeHtml(item.time)}</div>
+                    </div>
+                    <div class="qrscanner-data" title="${escapeHtml(item.data)}">${escapeHtml(item.data)}</div>
+                    <div class="qrscanner-source">${escapeHtml(shortText(item.source || item.pageUrl || '无来源信息', 120))}</div>
+                    <div class="qrscanner-actions">
+                        ${openButton}
+                        <button class="qrscanner-action qrscanner-action-soft" data-action="copy" data-id="${item.id}">复制内容</button>
+                        ${locateButton}
+                        <button class="qrscanner-action qrscanner-action-danger" data-action="remove" data-id="${item.id}">删除</button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    function openPanel() {
+        ui.panel.classList.add('open');
+    }
+
+    function closePanel() {
+        ui.panel.classList.remove('open');
+    }
+
+    function togglePanel() {
+        ui.panel.classList.toggle('open');
+    }
+
+    function markImageForResult(resultId, image) {
+        if (!image || !resultId) {
+            return;
+        }
+        image.dataset.qrscannerResultId = resultId;
+        locatedImages.set(resultId, image);
+    }
+
+    function highlightImage(resultId) {
+        const image = locatedImages.get(resultId) || document.querySelector(`img[data-qrscanner-result-id="${resultId}"]`);
+        if (!image) {
+            showToast({
+                type: 'error',
+                title: '定位失败',
+                message: '当前页面找不到对应图片，可能是结果来自旧页面或本地上传。'
+            });
+            return;
+        }
+
+        document.querySelectorAll('.qrscanner-highlight').forEach((node) => {
+            node.classList.remove('qrscanner-highlight');
+        });
+
+        image.classList.add('qrscanner-highlight');
+        image.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        window.setTimeout(() => image.classList.remove('qrscanner-highlight'), 2600);
+    }
+
+    function tryDecodeImageData(imageData, width, height) {
+        const modes = [
+            { inversionAttempts: 'attemptBoth' },
+            { inversionAttempts: 'dontInvert' },
+            { inversionAttempts: 'onlyInvert' }
+        ];
+
+        for (const mode of modes) {
+            try {
+                const code = jsQR(imageData.data, width, height, mode);
+                if (code && code.data && code.data.trim()) {
+                    return code.data.trim();
+                }
+            } catch (error) {}
+        }
         return null;
     }
 
-    async function scanPage() {
-        const found = [];
-        const imgs = Array.from(document.querySelectorAll('img'))
-            .filter(i => {
-                const w = i.naturalWidth || 0, h = i.naturalHeight || 0;
-                return w >= 20 && h >= 20 && w * h >= 400;
-            })
-            .slice(0, 50);
+    function createBinaryImageData(imageData) {
+        const cloned = new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
+        const data = cloned.data;
+        for (let i = 0; i < data.length; i += 4) {
+            const gray = (0.299 * data[i]) + (0.587 * data[i + 1]) + (0.114 * data[i + 2]);
+            const value = gray > 140 ? 255 : 0;
+            data[i] = value;
+            data[i + 1] = value;
+            data[i + 2] = value;
+        }
+        return cloned;
+    }
 
-        const batchSize = 6;
-        for (let i = 0; i < imgs.length; i += batchSize) {
-            const batch = imgs.slice(i, i + batchSize);
-            const batchItems = await Promise.all(batch.map(img => scanImage(img)));
-            batchItems.forEach(it => { if (it) found.push(it); });
+    function decodeCanvas(canvas) {
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) {
+            return null;
+        }
+
+        const original = context.getImageData(0, 0, canvas.width, canvas.height);
+        return tryDecodeImageData(original, canvas.width, canvas.height)
+            || tryDecodeImageData(createBinaryImageData(original), canvas.width, canvas.height);
+    }
+
+    function buildTargetSides(width, height) {
+        const maxSide = Math.max(width, height);
+        const candidates = [
+            Math.min(1440, Math.max(maxSide, 360)),
+            Math.min(1080, Math.max(maxSide, 280)),
+            Math.min(800, Math.max(maxSide, 220))
+        ];
+
+        return Array.from(new Set(candidates.map((value) => Math.round(value))))
+            .filter((value) => value >= 128)
+            .sort((a, b) => b - a);
+    }
+
+    function decodeDrawable(drawable, width, height) {
+        if (!width || !height || width < 20 || height < 20) {
+            return null;
+        }
+
+        const maxSide = Math.max(width, height);
+        const targetSides = buildTargetSides(width, height);
+
+        for (const targetSide of targetSides) {
+            const scale = targetSide / maxSide;
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(width * scale));
+            canvas.height = Math.max(1, Math.round(height * scale));
+
+            try {
+                const context = canvas.getContext('2d', { willReadFrequently: true });
+                if (!context) {
+                    continue;
+                }
+                context.drawImage(drawable, 0, 0, canvas.width, canvas.height);
+                const decoded = decodeCanvas(canvas);
+                if (decoded) {
+                    return decoded;
+                }
+            } catch (error) {}
+        }
+
+        return null;
+    }
+
+    async function decodeImageElement(image) {
+        if (!image || !image.complete) {
+            return null;
+        }
+
+        const width = image.naturalWidth || image.width;
+        const height = image.naturalHeight || image.height;
+        return decodeDrawable(image, width, height);
+    }
+
+    async function loadImageFromUrl(url) {
+        const image = new Image();
+        image.decoding = 'async';
+        image.referrerPolicy = 'no-referrer';
+        const promise = new Promise((resolve, reject) => {
+            image.onload = () => resolve(image);
+            image.onerror = () => reject(new Error('图片加载失败'));
+        });
+        image.src = url;
+        return promise;
+    }
+
+    async function decodeFile(file) {
+        const objectUrl = URL.createObjectURL(file);
+        try {
+            const image = await loadImageFromUrl(objectUrl);
+            return decodeDrawable(image, image.naturalWidth, image.naturalHeight);
+        } finally {
+            URL.revokeObjectURL(objectUrl);
+        }
+    }
+
+    function createResultFromDecoded(decoded, meta) {
+        if (!decoded) {
+            return null;
+        }
+
+        return normalizeResult({
+            id: makeHash(`${meta.origin}|${meta.source}|${decoded}`),
+            data: decoded,
+            source: meta.source,
+            origin: meta.origin,
+            kind: isUrl(decoded) ? 'url' : 'text',
+            time: new Date().toLocaleTimeString(),
+            createdAt: Date.now(),
+            pageUrl: location.href
+        });
+    }
+
+    async function scanImageElement(image) {
+        if (!image || !image.complete) {
+            return null;
+        }
+
+        const source = image.currentSrc || image.src || image.getAttribute('src') || '';
+        if (!source || scannedSources.has(source)) {
+            return null;
+        }
+
+        const width = image.naturalWidth || image.width || 0;
+        const height = image.naturalHeight || image.height || 0;
+        if (width < 24 || height < 24 || (width * height) < 900) {
+            scannedSources.add(source);
+            return null;
+        }
+
+        let decoded = null;
+        try {
+            decoded = await decodeImageElement(image);
+        } catch (error) {}
+
+        scannedSources.add(source);
+        if (!decoded) {
+            return null;
+        }
+
+        const result = createResultFromDecoded(decoded, {
+            origin: 'page',
+            source
+        });
+
+        if (result) {
+            markImageForResult(result.id, image);
+        }
+        return result;
+    }
+
+    async function scanPage() {
+        const images = Array.from(document.images)
+            .filter((image) => image.complete)
+            .slice(0, 120);
+
+        const found = [];
+        for (let i = 0; i < images.length; i += 4) {
+            const batch = images.slice(i, i + 4);
+            const batchResults = await Promise.all(batch.map((image) => scanImageElement(image)));
+            batchResults.forEach((item) => {
+                if (item) {
+                    found.push(item);
+                }
+            });
         }
         return found;
     }
 
-    function sendResults(items) {
-        if (!items || !items.length) return;
-        results = [...items, ...results];
-        try { GM_setValue('qrResults', JSON.stringify(results)); } catch (e) {}
-        renderResults();
+    async function runPageScan(options = {}) {
+        const { notify = false } = options;
+        let loadingToast = null;
+
+        if (notify) {
+            loadingToast = showToast({
+                type: 'loading',
+                title: '正在扫描',
+                message: '正在识别当前页面里的二维码图片... ',
+                duration: 0
+            });
+        }
+
+        try {
+            const found = await scanPage();
+            if (found.length) {
+                upsertResults(found);
+                if (notify) {
+                    showToast({
+                        type: 'success',
+                        title: '扫描完成',
+                        message: `本次共识别到 ${found.length} 条结果。`
+                    });
+                }
+            } else if (notify) {
+                showToast({
+                    type: 'error',
+                    title: '没有识别到二维码',
+                    message: '可以试试右键单张图片识别，或者直接上传本地图片。'
+                });
+            }
+            return found;
+        } finally {
+            if (loadingToast) {
+                loadingToast.remove();
+            }
+        }
     }
 
     function scheduleScan() {
-        clearTimeout(scanTimer);
-        scanTimer = setTimeout(() => scanPage().then(sendResults), 600);
+        window.clearTimeout(scanTimer);
+        scanTimer = window.setTimeout(() => {
+            runPageScan();
+        }, 800);
     }
 
-    function highlightResultId(targetId) {
-        document.querySelectorAll('.qrscanner-highlight').forEach(el => {
-            el.classList.remove('qrscanner-highlight');
-            el.style.outline = ''; el.style.outlineOffset = '';
-            el.style.backgroundColor = ''; el.style.boxShadow = '';
-        });
-        const img = document.querySelector(`img[data-qr-id="${targetId}"]`);
-        if (!img) return;
-        img.classList.add('qrscanner-highlight');
-        img.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        setTimeout(() => {
-            img.style.outline = '3px solid #667eea';
-            img.style.outlineOffset = '4px';
-            img.style.backgroundColor = 'rgba(102,126,234,0.1)';
-            img.style.boxShadow = '0 0 0 8px rgba(102,126,234,0.2), 0 0 25px rgba(102,126,234,0.4)';
-            img.style.zIndex = '2147483646';
-        }, 50);
-        setTimeout(() => {
-            img.classList.remove('qrscanner-highlight');
-            img.style.outline = ''; img.style.outlineOffset = '';
-            img.style.backgroundColor = ''; img.style.boxShadow = '';
-            img.style.zIndex = '';
-        }, 3000);
-    }
-
-    /* ==================== 右键扫描 ==================== */
-    async function handleContextScan(imageUrl) {
-        const loadingToast = showToast('正在识别二维码...', 'loading', 0, [], '识别中');
-        try {
-            let data = null;
-            const byImg = document.querySelector(`img[src="${CSS.escape(imageUrl)}"]`);
-
-            if (byImg && (byImg.naturalWidth||0) >= 21 && (byImg.naturalHeight||0) >= 21) {
-                data = await decodeCanvas(byImg);
-            }
-
-            if (!data) {
-                try {
-                    const image = new Image();
-                    await new Promise((resolve, reject) => {
-                        image.onload = async () => { data = await decodeCanvas(image); resolve(); };
-                        image.onerror = () => reject(new Error('图片加载失败'));
-                        image.src = imageUrl;
-                    });
-                } catch (e) {}
-            }
-
-            removeToast(loadingToast);
-
-            if (data) {
-                const isUrl = /^https?:\/\//i.test(data);
-                const actions = [];
-                if (isUrl) {
-                    actions.push({
-                        cls: 'qr-toast-btn',
-                        text: '🌐 打开链接',
-                        handler: () => window.open(data, '_blank')
-                    });
-                }
-                actions.push({
-                    cls: 'qr-toast-btn',
-                    text: '📋 复制内容',
-                    handler: () => {
-                        copyText(data);
-                        showToast('已复制到剪贴板', 'success', 2000, [], '复制成功');
-                    }
-                });
-                actions.push({
-                    cls: 'qr-toast-btn qr-toast-btn-secondary',
-                    text: '关闭',
-                    handler: () => {
-                        const el = document.querySelector('.qr-toast-success');
-                        if (el) el.remove();
-                        activeToasts = activeToasts.filter(t => !(t.type === 'success' && !t.persistent));
-                    }
-                });
-
-                showToast(`识别成功：${data}`, 'success', 0, actions, '识别成功');
-
-                // 同步到结果列表
-                const item = {
-                    id: btoa(imageUrl).replace(/[^a-z0-9]/gi, '').slice(-8),
-                    src: imageUrl,
-                    data,
-                    kind: isUrl ? 'url' : 'text',
-                    time: new Date().toLocaleTimeString()
-                };
-                sendResults([item]);
-            } else {
-                const actions = [
-                    {
-                        cls: 'qr-toast-btn',
-                        text: '🔍 打开原图试试',
-                        handler: () => window.open(imageUrl, '_blank')
-                    },
-                    {
-                        cls: 'qr-toast-btn qr-toast-btn-secondary',
-                        text: '关闭',
-                        handler: () => {
-                            const el = document.querySelector('.qr-toast-hint');
-                            if (el) el.remove();
-                            activeToasts = activeToasts.filter(t => !(t.type === 'hint' && !t.persistent));
-                        }
-                    }
-                ];
-                showToast('未检测到二维码，建议双击打开大图后再识别', 'hint', 0, actions, '识别失败');
-            }
-        } catch (e) {
-            removeToast(loadingToast);
-            showToast('识别失败：读取图片异常', 'error', 0, [
-                {
-                    cls: 'qr-toast-btn qr-toast-btn-secondary',
-                    text: '关闭',
-                    handler: () => {
-                        const el = document.querySelector('.qr-toast-error');
-                        if (el) el.remove();
-                        activeToasts = activeToasts.filter(t => !(t.type === 'error' && !t.persistent));
-                    }
-                }
-            ], '识别失败');
-        }
-    }
-
-    function initContextMenu() {
-        const menu = document.createElement('div');
-        menu.id = 'qrscanner-context-menu';
-        menu.innerHTML = '<div class="qr-cm-item" data-act="scan">识别此二维码</div>';
-        document.body.appendChild(menu);
-
-        document.addEventListener('contextmenu', e => {
-            const img = e.target.closest('img');
-            if (!img) { menu.style.display = 'none'; return; }
-            e.preventDefault();
-            const src = img.src || img.getAttribute('src');
-            if (!src) return;
-            menu.style.display = 'block';
-            menu.style.left = `${e.pageX}px`;
-            menu.style.top = `${e.pageY}px`;
-            menu.dataset.src = src;
-        });
-
-        document.addEventListener('click', e => { if (!menu.contains(e.target)) menu.style.display = 'none'; });
-
-        menu.addEventListener('click', async e => {
-            if (e.target.dataset.act !== 'scan') return;
-            const src = menu.dataset.src;
-            menu.style.display = 'none';
-            if (src) handleContextScan(src);
-        });
-    }
-
-    /* ==================== UI ==================== */
-    function renderResults() {
-        const list = document.getElementById('qrscanner-list');
-        const empty = document.getElementById('qrscanner-empty');
-        const clearBtn = document.getElementById('qrscanner-clear-all');
-
-        if (!results.length) {
-            list.innerHTML = '';
-            empty.style.display = 'block';
-            if (clearBtn) clearBtn.style.display = 'none';
+    async function handleUpload(files) {
+        const imageFiles = Array.from(files || []).filter((file) => /^image\//i.test(file.type));
+        if (!imageFiles.length) {
+            showToast({
+                type: 'error',
+                title: '上传失败',
+                message: '请选择图片文件后再试。'
+            });
             return;
         }
 
-        empty.style.display = 'none';
-        if (clearBtn) clearBtn.style.display = 'flex';
-
-        list.innerHTML = results.map(item => {
-            const isUrl = item.kind === 'url';
-            return `<div class="qr-item">
-                <div class="qr-meta">
-                    <span class="qr-badge ${isUrl ? 'qr-badge-url' : 'qr-badge-text'}">
-                        ${isUrl ? '🔗' : '📝'} ${isUrl ? '链接' : '文本'}
-                   </span>
-                    <span class="qr-time">${escapeHtml(item.time)}</span>
-               </div>
-                <div class="qr-text" title="${escapeHtml(item.data)}">${escapeHtml(item.data)}</div>
-                <div class="qr-actions">
-                    ${isUrl ? `<button class="qr-btn qr-btn-primary" data-id="${item.id}" data-act="open">🌐 打开</button>` : ''}
-                    <button class="qr-btn qr-btn-secondary" data-id="${item.id}" data-act="copy">📋 复制</button>
-                    <button class="qr-btn qr-btn-secondary" data-id="${item.id}" data-act="locate">🎯 定位</button>
-                    <button class="qr-btn qr-btn-danger" data-id="${item.id}" data-act="remove">🗑️ 删除</button>
-               </div>
-           </div>`;
-        }).join('');
-
-        // 立即绑定列表按钮事件
-        list.querySelectorAll('button[data-act]').forEach(btn => {
-            const id = btn.dataset.id, act = btn.dataset.act;
-            const item = results.find(r => r.id === id);
-            if (!item) return;
-
-            btn.onclick = () => {
-                if (act === 'open' && item.kind === 'url') {
-                    window.open(item.data, '_blank');
-                } else if (act === 'copy') {
-                    copyText(item.data);
-                    const original = btn.innerHTML;
-                    btn.innerHTML = '✓ 已复制';
-                    btn.style.background = '#d1fae5';
-                    btn.style.color = '#065f46';
-                    setTimeout(() => { btn.innerHTML = original; btn.style.cssText = ''; }, 1800);
-                } else if (act === 'locate') {
-                    highlightResultId(item.id);
-                } else if (act === 'remove') {
-                    results = results.filter(r => r.id !== id);
-                    try { GM_setValue('qrResults', JSON.stringify(results)); } catch (e) {}
-                    renderResults();
-                }
-            };
+        openPanel();
+        const loadingToast = showToast({
+            type: 'loading',
+            title: '正在识别',
+            message: `正在处理 ${imageFiles.length} 张上传图片...`,
+            duration: 0
         });
+
+        const found = [];
+        for (const file of imageFiles) {
+            try {
+                const decoded = await decodeFile(file);
+                const result = createResultFromDecoded(decoded, {
+                    origin: 'upload',
+                    source: `本地文件: ${file.name}`
+                });
+                if (result) {
+                    found.push(result);
+                }
+            } catch (error) {}
+        }
+
+        loadingToast.remove();
+        if (found.length) {
+            upsertResults(found);
+            showToast({
+                type: 'success',
+                title: '上传识别成功',
+                message: `成功识别 ${found.length} 张图片中的二维码。`
+            });
+        } else {
+            showToast({
+                type: 'error',
+                title: '上传后未识别到内容',
+                message: '如果图片很模糊、二维码太小，建议换原图或更高清截图再试。'
+            });
+        }
+    }
+
+    async function handleContextScan(image) {
+        if (!image) {
+            return;
+        }
+
+        const source = image.currentSrc || image.src || '';
+        if (!source) {
+            return;
+        }
+
+        openPanel();
+        const loadingToast = showToast({
+            type: 'loading',
+            title: '正在识别这张图片',
+            message: '正在尝试直接从当前页面图片中读取二维码...',
+            duration: 0
+        });
+
+        try {
+            let decoded = await decodeImageElement(image);
+            if (!decoded) {
+                const fallbackImage = await loadImageFromUrl(source);
+                decoded = decodeDrawable(fallbackImage, fallbackImage.naturalWidth, fallbackImage.naturalHeight);
+            }
+
+            loadingToast.remove();
+            if (!decoded) {
+                showToast({
+                    type: 'error',
+                    title: '识别失败',
+                    message: '这张图里没有识别到二维码，建议打开原图或上传本地原图再试。',
+                    actions: [
+                        {
+                            text: '打开原图',
+                            className: 'qrscanner-action qrscanner-action-main',
+                            onClick: () => window.open(source, '_blank')
+                        }
+                    ]
+                });
+                return;
+            }
+
+            const result = createResultFromDecoded(decoded, {
+                origin: 'context',
+                source
+            });
+
+            if (result) {
+                markImageForResult(result.id, image);
+                upsertResults([result]);
+            }
+
+            const actions = [
+                {
+                    text: '复制内容',
+                    className: 'qrscanner-action qrscanner-action-soft',
+                    onClick: async () => {
+                        const ok = await copyText(decoded);
+                        showToast({
+                            type: ok ? 'success' : 'error',
+                            title: ok ? '复制成功' : '复制失败',
+                            message: ok ? '二维码内容已复制到剪贴板。' : '浏览器拒绝了剪贴板访问。'
+                        });
+                    }
+                }
+            ];
+
+            if (isUrl(decoded)) {
+                actions.unshift({
+                    text: '打开链接',
+                    className: 'qrscanner-action qrscanner-action-main',
+                    onClick: () => window.open(decoded, '_blank')
+                });
+            }
+
+            showToast({
+                type: 'success',
+                title: '识别成功',
+                message: decoded,
+                actions,
+                duration: 0
+            });
+        } catch (error) {
+            loadingToast.remove();
+            showToast({
+                type: 'error',
+                title: '识别失败',
+                message: '读取图片时发生异常，可能是图片未加载完成或已被站点限制。'
+            });
+        }
     }
 
     function buildUI() {
-        const panel = document.createElement('div');
-        panel.id = 'qrscanner-panel';
+        const panel = document.createElement('aside');
+        panel.id = PANEL_ID;
         panel.innerHTML = `
-            <div class="qr-header">
-                <h1>🔍 二维码识别器</h1>
-                <button class="qr-close" id="qrscanner-close">✕</button>
-           </div>
-            <div class="qr-body">
-                <div id="qrscanner-list</div>
-                <div id="qrscanner-empty" class="qr-empty">
-                    <div class="qr-empty-icon">🔎</div>
-                    <div class="qr-empty-title">暂无识别结果</div>
-                    <div class="qr-empty-desc">页面中可能不包含二维码，或二维码太小无法识别</div>
-               </div>
-           </div>
-            <button id="qrscanner-clear-all" class="clear-all-btn" style="display:none;">🗑️ 清除所有结果</button>
+            <div class="qrscanner-header">
+                <div class="qrscanner-header-top">
+                    <div>
+                        <h1 class="qrscanner-title">二维码识别器</h1>
+                        <div class="qrscanner-subtitle">自动扫描网页图片，也支持本地上传。按住 Shift 再右键可以继续使用网页原生菜单。</div>
+                    </div>
+                    <button class="qrscanner-close" type="button" id="qrscanner-close-btn">×</button>
+                </div>
+            </div>
+            <div class="qrscanner-body">
+                <div class="qrscanner-status" id="qrscanner-status"></div>
+                <div class="qrscanner-toolbar">
+                    <button type="button" class="qrscanner-btn qrscanner-btn-primary" id="qrscanner-upload-btn">上传识别</button>
+                    <button type="button" class="qrscanner-btn qrscanner-btn-secondary" id="qrscanner-rescan-btn">重新扫描</button>
+                    <button type="button" class="qrscanner-btn qrscanner-btn-danger" id="qrscanner-clear-btn">清空结果</button>
+                </div>
+                <div class="qrscanner-dropzone" id="qrscanner-dropzone">
+                    <div class="qrscanner-dropzone-title">拖图片到这里，或点击“上传识别”</div>
+                    <div class="qrscanner-dropzone-desc">适合直接识别聊天截图、二维码海报、下载后的原图。</div>
+                </div>
+                <div class="qrscanner-hint">
+                    上传识别是本次补上的稳定入口，不依赖网页图片加载状态；如果你之前是“上传后没效果”，这里会比原来的流程可靠很多。
+                </div>
+                <div class="qrscanner-empty" id="qrscanner-empty">
+                    <div class="qrscanner-empty-icon">⌁</div>
+                    <div class="qrscanner-empty-title">还没有识别结果</div>
+                    <div class="qrscanner-empty-desc">可以先点“重新扫描”，也可以直接上传本地二维码图片。</div>
+                </div>
+                <div class="qrscanner-list" id="qrscanner-list"></div>
+            </div>
         `;
         document.body.appendChild(panel);
 
-        document.getElementById('qrscanner-close').onclick = () => panel.classList.remove('open');
-
-        const clearBtn = document.getElementById('qrscanner-clear-all');
-        clearBtn.onclick = () => {
-            results = [];
-            try { GM_setValue('qrResults', JSON.stringify([])); } catch (e) {}
-            renderResults();
-        };
-
         const toggle = document.createElement('button');
-        toggle.id = 'qrscanner-toggle';
+        toggle.id = TOGGLE_ID;
+        toggle.type = 'button';
         toggle.title = '打开二维码识别器';
+        toggle.innerHTML = `⌗<span class="qrscanner-toggle-badge" style="display:none;">0</span>`;
         document.body.appendChild(toggle);
 
-        toggle.onclick = () => {
-            if (panel.classList.contains('open')) {
-                panel.classList.remove('open');
-            } else {
-                if (!results.length) {
-                    showToast('正在扫描页面二维码...', 'loading', 2000, [], '扫描中');
-                    scanPage().then(items => {
-                        if (items.length) sendResults(items);
-                    });
-                }
-                panel.classList.add('open');
+        const input = document.createElement('input');
+        input.id = FILE_INPUT_ID;
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.multiple = true;
+        input.style.display = 'none';
+        document.body.appendChild(input);
+
+        const menu = document.createElement('div');
+        menu.id = MENU_ID;
+        menu.innerHTML = `
+            <button type="button" class="qrscanner-menu-item" data-menu-action="scan">识别这张图片</button>
+            <button type="button" class="qrscanner-menu-item" data-menu-action="open">在新标签打开原图</button>
+        `;
+        document.body.appendChild(menu);
+
+        ui.panel = panel;
+        ui.list = panel.querySelector('#qrscanner-list');
+        ui.empty = panel.querySelector('#qrscanner-empty');
+        ui.status = panel.querySelector('#qrscanner-status');
+        ui.toggle = toggle;
+        ui.uploadInput = input;
+        ui.dropzone = panel.querySelector('#qrscanner-dropzone');
+        ui.menu = menu;
+
+        panel.querySelector('#qrscanner-close-btn').addEventListener('click', closePanel);
+        toggle.addEventListener('click', togglePanel);
+        panel.querySelector('#qrscanner-upload-btn').addEventListener('click', () => input.click());
+        panel.querySelector('#qrscanner-rescan-btn').addEventListener('click', () => runPageScan({ notify: true }));
+        panel.querySelector('#qrscanner-clear-btn').addEventListener('click', clearResults);
+        input.addEventListener('change', (event) => {
+            handleUpload(event.target.files);
+            event.target.value = '';
+        });
+
+        ui.dropzone.addEventListener('dragover', (event) => {
+            event.preventDefault();
+            ui.dropzone.classList.add('dragover');
+        });
+        ui.dropzone.addEventListener('dragleave', () => {
+            ui.dropzone.classList.remove('dragover');
+        });
+        ui.dropzone.addEventListener('drop', (event) => {
+            event.preventDefault();
+            ui.dropzone.classList.remove('dragover');
+            handleUpload(event.dataTransfer.files);
+        });
+
+        ui.list.addEventListener('click', async (event) => {
+            const button = event.target.closest('button[data-action]');
+            if (!button) {
+                return;
             }
-        };
+
+            const { action, id } = button.dataset;
+            const item = results.find((result) => result.id === id);
+            if (!item) {
+                return;
+            }
+
+            if (action === 'open' && item.kind === 'url') {
+                window.open(item.data, '_blank');
+                return;
+            }
+
+            if (action === 'copy') {
+                const ok = await copyText(item.data);
+                showToast({
+                    type: ok ? 'success' : 'error',
+                    title: ok ? '复制成功' : '复制失败',
+                    message: ok ? '二维码内容已复制。' : '浏览器拒绝了剪贴板访问。'
+                });
+                return;
+            }
+
+            if (action === 'locate') {
+                highlightImage(id);
+                return;
+            }
+
+            if (action === 'remove') {
+                removeResult(id);
+            }
+        });
     }
 
-    /* ==================== 初始化 ==================== */
-    function init() {
-        buildUI();
-        initContextMenu();
+    function hideContextMenu() {
+        if (ui.menu) {
+            ui.menu.style.display = 'none';
+        }
+        currentContextImage = null;
+    }
 
-        // 延迟首次扫描
-        setTimeout(() => {
-            scanPage().then(items => {
-                if (items.length) sendResults(items);
-            });
-        }, 1200);
+    function initContextMenu() {
+        document.addEventListener('contextmenu', (event) => {
+            const image = event.target.closest('img');
+            if (!image || event.shiftKey) {
+                hideContextMenu();
+                return;
+            }
 
-        // 监听 DOM 变化
-        const observer = new MutationObserver(() => {
-            clearTimeout(scanTimer);
-            scheduleScan();
+            const source = image.currentSrc || image.src || image.getAttribute('src');
+            if (!source) {
+                hideContextMenu();
+                return;
+            }
+
+            event.preventDefault();
+            currentContextImage = image;
+            ui.menu.style.display = 'block';
+            ui.menu.style.left = `${Math.min(event.clientX, window.innerWidth - 204)}px`;
+            ui.menu.style.top = `${Math.min(event.clientY, window.innerHeight - 110)}px`;
         });
-        observer.observe(document.body || document.documentElement, {
-            childList: true, subtree: true, attributes: true,
-            attributeFilter: ['src', 'style']
+
+        document.addEventListener('click', (event) => {
+            if (ui.menu && !ui.menu.contains(event.target)) {
+                hideContextMenu();
+            }
         });
 
-        // 油猴菜单命令
-        if (typeof GM_registerMenuCommand === 'function') {
-            GM_registerMenuCommand('🔄 重新扫描当前页', async () => {
-                results = [];
-                try { GM_setValue('qrResults', JSON.stringify([])); } catch (e) {}
-                showToast('正在重新扫描...', 'loading', 2000, [], '扫描中');
-                const items = await scanPage();
-                sendResults(items);
-            });
+        ui.menu.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-menu-action]');
+            if (!button || !currentContextImage) {
+                return;
+            }
+
+            const image = currentContextImage;
+            const source = image.currentSrc || image.src;
+            const action = button.dataset.menuAction;
+            hideContextMenu();
+
+            if (action === 'scan') {
+                handleContextScan(image);
+            } else if (action === 'open' && source) {
+                window.open(source, '_blank');
+            }
+        });
+    }
+
+    function initMenus() {
+        if (typeof GM_registerMenuCommand !== 'function') {
+            return;
         }
 
-        // 加载缓存
-        try {
-            const cached = GM_getValue('qrResults');
-            if (cached) {
-                const arr = JSON.parse(cached);
-                if (Array.isArray(arr)) {
-                    results = arr;
-                    renderResults();
+        GM_registerMenuCommand('打开二维码识别器', () => openPanel());
+        GM_registerMenuCommand('上传本地二维码图片', () => ui.uploadInput.click());
+        GM_registerMenuCommand('重新扫描当前页面', () => runPageScan({ notify: true }));
+    }
+
+    function initObserver() {
+        const observer = new MutationObserver((mutations) => {
+            const changed = mutations.some((mutation) => {
+                if (mutation.type === 'childList') {
+                    return mutation.addedNodes.length > 0;
+                }
+                if (mutation.type === 'attributes') {
+                    return mutation.attributeName === 'src';
+                }
+                return false;
+            });
+
+            if (changed) {
+                scheduleScan();
+            }
+        });
+
+        observer.observe(document.body || document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['src']
+        });
+    }
+
+    function restoreLocatedImages() {
+        results.forEach((item) => {
+            if ((item.origin === 'page' || item.origin === 'context') && item.source) {
+                const image = Array.from(document.images).find((img) => {
+                    const src = img.currentSrc || img.src || img.getAttribute('src') || '';
+                    return src === item.source;
+                });
+                if (image) {
+                    markImageForResult(item.id, image);
                 }
             }
-        } catch (e) {}
+        });
+    }
+
+    async function init() {
+        results = loadResults().map(normalizeResult);
+        saveResults();
+        buildUI();
+        initContextMenu();
+        initMenus();
+        renderResults();
+        restoreLocatedImages();
+
+        window.setTimeout(() => {
+            runPageScan();
+        }, 1200);
+
+        initObserver();
     }
 
     init();

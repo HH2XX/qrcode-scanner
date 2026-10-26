@@ -101,14 +101,6 @@
 
 - [qrcode-scanner.user.js](./qrcode-scanner.user.js)：主用户脚本
 - [README.md](./README.md)：项目说明
-- [BLOG.md](./BLOG.md)：实现记录
-
-## 权限说明
-
-    @grant  GM_xmlhttpRequest
-    @connect *
-
-用于右键识别跨域图片时重新读取图片字节。只有在你主动右键点击「识别这张图片」时才会发起请求，自动扫描不会触发网络请求。
 
 ## License
 
